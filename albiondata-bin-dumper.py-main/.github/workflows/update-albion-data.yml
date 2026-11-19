@@ -1,0 +1,180 @@
+name: Update Albion Online data
+
+on:
+  schedule:
+    # Daily maintenance starts around 10:00 UTC; run one hour later.
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: albion-data-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: windows-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pycryptodome xmltodict
+
+      - name: Download SteamCMD
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $steamCmdDirectory = "C:\steamcmd"
+          New-Item -ItemType Directory -Force -Path $steamCmdDirectory | Out-Null
+
+          $archive = Join-Path $env:RUNNER_TEMP "steamcmd.zip"
+          Invoke-WebRequest `
+            -Uri "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip" `
+            -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $steamCmdDirectory -Force
+
+      - name: Download and update Albion Online
+        id: install_game
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+          }
+          $steamCmd = "C:\steamcmd\steamcmd.exe"
+          $installDirectory = "C:\Albion"
+          New-Item -ItemType Directory -Force -Path $installDirectory | Out-Null
+
+          $success = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "SteamCMD update attempt $attempt of 3"
+            & $steamCmd `
+              +@sSteamCmdForcePlatformType windows `
+              +force_install_dir $installDirectory `
+              +login anonymous `
+              +app_update 761890 validate `
+              +quit
+
+            if ($LASTEXITCODE -eq 0) {
+              $success = $true
+              break
+            }
+
+            if ($attempt -lt 3) {
+              Start-Sleep -Seconds 30
+            }
+          }
+
+          if (-not $success) {
+            throw "SteamCMD failed to install Albion Online after 3 attempts."
+          }
+
+          $gameData = Get-ChildItem `
+            -Path $installDirectory `
+            -Directory `
+            -Filter "GameData" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'StreamingAssets\\GameData$' } |
+            Select-Object -First 1
+
+          if (-not $gameData) {
+            throw "Albion Online GameData directory was not found under $installDirectory."
+          }
+
+          "game_data=$($gameData.FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: Clear stale extracted data
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (Test-Path "data") {
+            Remove-Item "data" -Recurse -Force
+          }
+          New-Item "data" -ItemType Directory | Out-Null
+
+      - name: Decrypt game files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python app.py `
+            --main-game-folder "${{ steps.install_game.outputs.game_data }}" `
+            --output "${{ github.workspace }}\data" `
+            --flat-output
+          if ($LASTEXITCODE -ne 0) {
+            throw "Albion data decryption failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Validate extracted data
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $files = Get-ChildItem "data" -File -Recurse
+          $xmlCount = @($files | Where-Object { $_.Extension -eq ".xml" }).Count
+          $jsonCount = @($files | Where-Object { $_.Extension -eq ".json" }).Count
+
+          if ($xmlCount -eq 0 -and $jsonCount -eq 0) {
+            throw "Decryption produced no XML or JSON files."
+          }
+
+          "XML files: $xmlCount" >> $env:GITHUB_STEP_SUMMARY
+          "JSON files: $jsonCount" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Commit extracted data
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          git config user.name "github-actions[bot]"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to configure the Git user name."
+          }
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to configure the Git user email."
+          }
+          git add --all -- data
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to stage the extracted data."
+          }
+
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            "No extracted data changes detected." >> $env:GITHUB_STEP_SUMMARY
+            exit 0
+          }
+          if ($LASTEXITCODE -ne 1) {
+            throw "Unable to inspect the extracted data changes."
+          }
+
+          git diff --cached --stat
+          git commit -m "chore: update Albion Online game data"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to commit the extracted data."
+          }
+          git push origin "HEAD:${{ github.ref_name }}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to push the extracted data."
+          }
+
+      - name: Delete downloaded game
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($path in @("C:\Albion", "C:\steamcmd")) {
+            if (Test-Path $path) {
+              Remove-Item $path -Recurse -Force
+            }
+          }
