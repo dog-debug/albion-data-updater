@@ -38,22 +38,60 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $installer = Join-Path $env:RUNNER_TEMP "albion-online-setup.exe"
-          $installerUrl = "https://live.albiononline.com/clients/20250827164405/albion-online-setup.exe"
-
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
+          $baseUrl = "https://live.albiononline.com/clients"
+          $downloadedSuccessfully = $false
+          
+          # Generate candidate URLs with timestamps from the last 60 days
+          # Albion typically updates weekly, so checking recent timestamps makes sense
+          $candidateUrls = @()
+          
+          # Add most recent known working version
+          $candidateUrls += "$baseUrl/20261102100206/albion-online-setup.exe"
+          
+          # Generate timestamps for the last 30 days (every 6 hours)
+          $now = Get-Date
+          for ($daysBack = 0; $daysBack -le 30; $daysBack++) {
+            $date = $now.AddDays(-$daysBack)
+            for ($hour = 0; $hour -lt 24; $hour += 6) {
+              $testDate = $date.AddHours($hour)
+              $timestamp = $testDate.ToString("yyyyMMddHHmmss")
+              $candidateUrls += "$baseUrl/$timestamp/albion-online-setup.exe"
+            }
+          }
+          
+          # Remove duplicates while preserving order
+          $candidateUrls = $candidateUrls | Select-Object -Unique
+          
+          Write-Host "Generated $(($candidateUrls | Measure-Object).Count) candidate URLs to test..."
+          
+          foreach ($url in $candidateUrls) {
             try {
-              Invoke-WebRequest -Uri $installerUrl -OutFile $installer -MaximumRedirection 10
-              if ((Get-Item $installer).Length -lt 100MB) {
-                throw "Downloaded Albion installer is unexpectedly small."
+              Write-Host "Testing: $url"
+              $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 5 -TimeoutSec 10 -ErrorAction Stop
+              if ($response.StatusCode -eq 200) {
+                Write-Host "Found working URL, downloading..."
+                Invoke-WebRequest -Uri $url -OutFile $installer -MaximumRedirection 10 -TimeoutSec 300 -ErrorAction Stop
+                
+                $fileSize = (Get-Item $installer).Length
+                $fileSizeMB = [math]::Round($fileSize / 1MB, 2)
+                
+                if ($fileSize -lt 50MB) {
+                  Write-Host "Warning: Downloaded file is small ($fileSizeMB MB), but proceeding..."
+                }
+                
+                Write-Host "Successfully downloaded installer ($fileSizeMB MB)"
+                $downloadedSuccessfully = $true
+                break
               }
-              break
             }
             catch {
-              if ($attempt -eq 3) {
-                throw "Unable to download the official Albion Online installer: $($_.Exception.Message)"
-              }
-              Start-Sleep -Seconds 30
+              # Continue to next URL
+              Write-Host "URL not found or unreachable"
             }
+          }
+          
+          if (-not $downloadedSuccessfully) {
+            throw "Unable to download the official Albion Online installer from any candidate URL."
           }
 
       - name: Download and update Albion Online
