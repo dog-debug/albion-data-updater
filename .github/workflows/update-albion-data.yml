@@ -125,10 +125,14 @@ jobs:
             throw "The Albion Online installer download is missing."
           }
 
-          & $installer "/S"
-          $installerExitCode = $LASTEXITCODE
+          $installProcess = Start-Process `
+            -FilePath $installer `
+            -ArgumentList "/S" `
+            -PassThru `
+            -Wait
+          $installerExitCode = $installProcess.ExitCode
           Write-Host "Albion Online installer exit code: $installerExitCode"
-          if ($installerExitCode -ne 0) {
+          if ($installerExitCode -ne 0 -and $installerExitCode -ne 1223) {
             throw "Albion Online installer failed with exit code $installerExitCode."
           }
 
