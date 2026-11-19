@@ -5,6 +5,11 @@ on:
     # Daily maintenance starts around 10:00 UTC; run one hour later.
     - cron: "0 11 * * *"
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/update-albion-data.yml"
 
 permissions:
   contents: write
@@ -39,57 +44,72 @@ jobs:
           $ErrorActionPreference = "Stop"
           $installer = Join-Path $env:RUNNER_TEMP "albion-online-setup.exe"
           $baseUrl = "https://live.albiononline.com/clients"
-          $downloadedSuccessfully = $false
-          
-          # Generate candidate URLs with timestamps from the last 60 days
-          # Albion typically updates weekly, so checking recent timestamps makes sense
-          $candidateUrls = @()
-          
-          # Add most recent known working version
-          $candidateUrls += "$baseUrl/20261102100206/albion-online-setup.exe"
-          
-          # Generate timestamps for the last 30 days (every 6 hours)
-          $now = Get-Date
-          for ($daysBack = 0; $daysBack -le 30; $daysBack++) {
-            $date = $now.AddDays(-$daysBack)
-            for ($hour = 0; $hour -lt 24; $hour += 6) {
-              $testDate = $date.AddHours($hour)
-              $timestamp = $testDate.ToString("yyyyMMddHHmmss")
-              $candidateUrls += "$baseUrl/$timestamp/albion-online-setup.exe"
+          $candidateUrls = [System.Collections.Generic.List[string]]::new()
+
+          foreach ($pageUrl in @(
+            "https://albiononline.com/en/download",
+            "https://albiononline.com/download"
+          )) {
+            try {
+              $page = Invoke-WebRequest -Uri $pageUrl -MaximumRedirection 10 -TimeoutSec 30 -UseBasicParsing
+              foreach ($match in [regex]::Matches(
+                $page.Content,
+                "https://live\.albiononline\.com/clients/\d+/albion-online-setup\.exe",
+                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+              )) {
+                $candidateUrls.Add($match.Value)
+              }
+            }
+            catch {
+              Write-Host "Could not inspect Albion download page: $($_.Exception.Message)"
             }
           }
-          
-          # Remove duplicates while preserving order
-          $candidateUrls = $candidateUrls | Select-Object -Unique
-          
-          Write-Host "Generated $(($candidateUrls | Measure-Object).Count) candidate URLs to test..."
-          
+
+          $candidateUrls.Add("$baseUrl/20261102100206/albion-online-setup.exe")
+
+          $candidateUrls = @($candidateUrls | Select-Object -Unique)
+          $downloadedSuccessfully = $false
+
+          Write-Host "Testing $($candidateUrls.Count) official installer URL(s)..."
+
           foreach ($url in $candidateUrls) {
             try {
               Write-Host "Testing: $url"
-              $response = Invoke-WebRequest -Uri $url -Method Head -MaximumRedirection 5 -TimeoutSec 10 -ErrorAction Stop
+              $response = Invoke-WebRequest `
+                -Uri $url `
+                -Method Head `
+                -MaximumRedirection 5 `
+                -TimeoutSec 30 `
+                -UseBasicParsing `
+                -ErrorAction Stop
+
               if ($response.StatusCode -eq 200) {
                 Write-Host "Found working URL, downloading..."
-                Invoke-WebRequest -Uri $url -OutFile $installer -MaximumRedirection 10 -TimeoutSec 300 -ErrorAction Stop
-                
+                Invoke-WebRequest `
+                  -Uri $url `
+                  -OutFile $installer `
+                  -MaximumRedirection 10 `
+                  -TimeoutSec 600 `
+                  -UseBasicParsing `
+                  -ErrorAction Stop
+
                 $fileSize = (Get-Item $installer).Length
                 $fileSizeMB = [math]::Round($fileSize / 1MB, 2)
-                
-                if ($fileSize -lt 50MB) {
-                  Write-Host "Warning: Downloaded file is small ($fileSizeMB MB), but proceeding..."
+
+                if ($fileSize -lt 100MB) {
+                  throw "Downloaded Albion installer is unexpectedly small ($fileSizeMB MB)."
                 }
-                
+
                 Write-Host "Successfully downloaded installer ($fileSizeMB MB)"
                 $downloadedSuccessfully = $true
                 break
               }
             }
             catch {
-              # Continue to next URL
-              Write-Host "URL not found or unreachable"
+              Write-Host "URL unavailable: $($_.Exception.Message)"
             }
           }
-          
+
           if (-not $downloadedSuccessfully) {
             throw "Unable to download the official Albion Online installer from any candidate URL."
           }
@@ -99,23 +119,17 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $installDirectory = "C:\Albion"
           $installer = Join-Path $env:RUNNER_TEMP "albion-online-setup.exe"
 
           if (-not (Test-Path $installer)) {
             throw "The Albion Online installer download is missing."
           }
 
-          New-Item -ItemType Directory -Force -Path $installDirectory | Out-Null
-
-          $installProcess = Start-Process `
-            -FilePath $installer `
-            -ArgumentList "/S", "/D=$installDirectory" `
-            -PassThru `
-            -Wait
-
-          if ($installProcess.ExitCode -ne 0 -and $installProcess.ExitCode -ne 1223) {
-            throw "Albion Online installer failed with exit code $($installProcess.ExitCode)."
+          & $installer "/S"
+          $installerExitCode = $LASTEXITCODE
+          Write-Host "Albion Online installer exit code: $installerExitCode"
+          if ($installerExitCode -ne 0) {
+            throw "Albion Online installer failed with exit code $installerExitCode."
           }
 
           function Find-GameData {
@@ -132,7 +146,10 @@ jobs:
                 -Filter "GameData" `
                 -Recurse `
                 -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match 'StreamingAssets\\GameData$' } |
+                Where-Object {
+                  $_.FullName -match '[\\/]StreamingAssets[\\/]GameData$' -and
+                  @(Get-ChildItem -Path $_.FullName -Filter "*.bin" -File -ErrorAction SilentlyContinue).Count -gt 0
+                } |
                 Select-Object -First 1
 
               if ($gameData) {
@@ -143,31 +160,77 @@ jobs:
             return $null
           }
 
-          $searchRoots = @(
-            $installDirectory,
+          $searchRoots = [System.Collections.Generic.List[string]]::new()
+          foreach ($registryPath in @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+          )) {
+            if (-not (Test-Path $registryPath)) {
+              continue
+            }
+
+            Get-ChildItem $registryPath -ErrorAction SilentlyContinue |
+              Get-ItemProperty |
+              Where-Object {
+                $_.DisplayName -match "Albion Online" -or $_.Publisher -match "Sandbox Interactive"
+              } |
+              ForEach-Object {
+                foreach ($candidate in @($_.InstallLocation, $_.DisplayIcon, $_.UninstallString)) {
+                  if ([string]::IsNullOrWhiteSpace($candidate)) {
+                    continue
+                  }
+
+                  $candidate = $candidate.Trim().Trim('"')
+                  if ($candidate -match "\.exe(?:$|\s)") {
+                    $candidate = [System.IO.Path]::GetDirectoryName(
+                      ($candidate -replace '^"([^"]+)".*$', '$1')
+                    )
+                  }
+
+                  if ($candidate -and (Test-Path $candidate)) {
+                    $searchRoots.Add($candidate)
+                  }
+                }
+              }
+          }
+
+          foreach ($root in @(
+            "C:\Albion",
             "C:\Program Files\Albion Online",
             "C:\Program Files (x86)\Albion Online",
             (Join-Path $env:LOCALAPPDATA "Albion Online")
-          )
+          )) {
+            if (Test-Path $root) {
+              $searchRoots.Add($root)
+            }
+          }
 
+          $searchRoots = @($searchRoots | Select-Object -Unique)
           $gameData = Find-GameData -Roots $searchRoots
 
           if (-not $gameData) {
-            $launcher = Get-ChildItem `
-              -Path $searchRoots `
-              -File `
-              -Filter "*.exe" `
-              -Recurse `
-              -ErrorAction SilentlyContinue |
-              Where-Object {
-                $_.Name -in @(
-                  "Albion-Online.exe",
-                  "Albion-Online-Launcher.exe",
-                  "Albion-Online_Launcher.exe",
-                  "AlbionLauncher.exe"
-                )
-              } |
-              Select-Object -First 1
+            $launcher = $null
+            foreach ($knownLauncher in @(
+              "C:\Program Files (x86)\Albion Online\launcher\AlbionLauncher.exe",
+              "C:\Program Files\Albion Online\launcher\AlbionLauncher.exe",
+              "C:\Albion\launcher\AlbionLauncher.exe"
+            )) {
+              if (Test-Path $knownLauncher) {
+                $launcher = Get-Item $knownLauncher
+                break
+              }
+            }
+
+            if (-not $launcher) {
+              $launcher = Get-ChildItem `
+                -Path $searchRoots `
+                -File `
+                -Filter "AlbionLauncher.exe" `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            }
 
             $launcherProcess = $null
             if ($launcher) {
@@ -177,12 +240,18 @@ jobs:
                 -WorkingDirectory $launcher.DirectoryName `
                 -PassThru
             }
+            else {
+              Write-Host "No Albion launcher executable was found."
+            }
 
-            $deadline = (Get-Date).AddMinutes(15)
+            $deadline = (Get-Date).AddMinutes(30)
             while ((Get-Date) -lt $deadline) {
               $gameData = Find-GameData -Roots $searchRoots
               if ($gameData) {
                 break
+              }
+              if (($launcherProcess) -and ($launcherProcess.HasExited)) {
+                Write-Host "Albion launcher exited before GameData appeared."
               }
               Start-Sleep -Seconds 15
             }
