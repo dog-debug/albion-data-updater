@@ -1,0 +1,8 @@
+# Known Albion Online Build Timestamps
+# Format: TIMESTAMP (yyyyMMddHHmmss) = Description
+#
+# This file tracks installer download URLs that have been verified to work.
+# When workflow failures indicate a URL is outdated, add the new timestamp here.
+# The workflow will check these in order before falling back to timestamp generation.
+
+20261102100206=Latest known working build (Nov 2, 2026)
