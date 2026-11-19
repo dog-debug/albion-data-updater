@@ -33,66 +33,129 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pycryptodome xmltodict
 
-      - name: Download SteamCMD
+      - name: Download official Albion Online installer
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $steamCmdDirectory = "C:\steamcmd"
-          New-Item -ItemType Directory -Force -Path $steamCmdDirectory | Out-Null
+          $installer = Join-Path $env:RUNNER_TEMP "albion-online-setup.exe"
+          $installerUrl = "https://live.albiononline.com/clients/20250827164405/albion-online-setup.exe"
 
-          $archive = Join-Path $env:RUNNER_TEMP "steamcmd.zip"
-          Invoke-WebRequest `
-            -Uri "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip" `
-            -OutFile $archive
-          Expand-Archive -LiteralPath $archive -DestinationPath $steamCmdDirectory -Force
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $installerUrl -OutFile $installer -MaximumRedirection 10
+              if ((Get-Item $installer).Length -lt 100MB) {
+                throw "Downloaded Albion installer is unexpectedly small."
+              }
+              break
+            }
+            catch {
+              if ($attempt -eq 3) {
+                throw "Unable to download the official Albion Online installer: $($_.Exception.Message)"
+              }
+              Start-Sleep -Seconds 30
+            }
+          }
 
       - name: Download and update Albion Online
         id: install_game
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
-            $PSNativeCommandUseErrorActionPreference = $false
-          }
-          $steamCmd = "C:\steamcmd\steamcmd.exe"
           $installDirectory = "C:\Albion"
+          $installer = Join-Path $env:RUNNER_TEMP "albion-online-setup.exe"
+
+          if (-not (Test-Path $installer)) {
+            throw "The Albion Online installer download is missing."
+          }
+
           New-Item -ItemType Directory -Force -Path $installDirectory | Out-Null
 
-          $success = $false
-          for ($attempt = 1; $attempt -le 3; $attempt++) {
-            Write-Host "SteamCMD update attempt $attempt of 3"
-            & $steamCmd `
-              +@sSteamCmdForcePlatformType windows `
-              +force_install_dir $installDirectory `
-              +login anonymous `
-              +app_update 761890 validate `
-              +quit
+          $installProcess = Start-Process `
+            -FilePath $installer `
+            -ArgumentList "/S", "/D=$installDirectory" `
+            -PassThru `
+            -Wait
 
-            if ($LASTEXITCODE -eq 0) {
-              $success = $true
-              break
-            }
-
-            if ($attempt -lt 3) {
-              Start-Sleep -Seconds 30
-            }
+          if ($installProcess.ExitCode -ne 0 -and $installProcess.ExitCode -ne 1223) {
+            throw "Albion Online installer failed with exit code $($installProcess.ExitCode)."
           }
 
-          if (-not $success) {
-            throw "SteamCMD failed to install Albion Online after 3 attempts."
+          function Find-GameData {
+            param([string[]]$Roots)
+
+            foreach ($root in $Roots) {
+              if (-not (Test-Path $root)) {
+                continue
+              }
+
+              $gameData = Get-ChildItem `
+                -Path $root `
+                -Directory `
+                -Filter "GameData" `
+                -Recurse `
+                -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'StreamingAssets\\GameData$' } |
+                Select-Object -First 1
+
+              if ($gameData) {
+                return $gameData
+              }
+            }
+
+            return $null
           }
 
-          $gameData = Get-ChildItem `
-            -Path $installDirectory `
-            -Directory `
-            -Filter "GameData" `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -match 'StreamingAssets\\GameData$' } |
-            Select-Object -First 1
+          $searchRoots = @(
+            $installDirectory,
+            "C:\Program Files\Albion Online",
+            "C:\Program Files (x86)\Albion Online",
+            (Join-Path $env:LOCALAPPDATA "Albion Online")
+          )
+
+          $gameData = Find-GameData -Roots $searchRoots
 
           if (-not $gameData) {
-            throw "Albion Online GameData directory was not found under $installDirectory."
+            $launcher = Get-ChildItem `
+              -Path $searchRoots `
+              -File `
+              -Filter "*.exe" `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Name -in @(
+                  "Albion-Online.exe",
+                  "Albion-Online-Launcher.exe",
+                  "Albion-Online_Launcher.exe",
+                  "AlbionLauncher.exe"
+                )
+              } |
+              Select-Object -First 1
+
+            $launcherProcess = $null
+            if ($launcher) {
+              Write-Host "Starting the Albion launcher to complete the game download."
+              $launcherProcess = Start-Process `
+                -FilePath $launcher.FullName `
+                -WorkingDirectory $launcher.DirectoryName `
+                -PassThru
+            }
+
+            $deadline = (Get-Date).AddMinutes(15)
+            while ((Get-Date) -lt $deadline) {
+              $gameData = Find-GameData -Roots $searchRoots
+              if ($gameData) {
+                break
+              }
+              Start-Sleep -Seconds 15
+            }
+
+            if ($launcherProcess -and -not $launcherProcess.HasExited) {
+              Stop-Process -Id $launcherProcess.Id -Force
+            }
+          }
+
+          if (-not $gameData) {
+            throw "Albion Online GameData directory was not found after installation."
           }
 
           "game_data=$($gameData.FullName)" >> $env:GITHUB_OUTPUT
@@ -173,7 +236,12 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          foreach ($path in @("C:\Albion", "C:\steamcmd")) {
+          foreach ($path in @(
+            "C:\Albion",
+            "C:\Program Files\Albion Online",
+            "C:\Program Files (x86)\Albion Online",
+            (Join-Path $env:LOCALAPPDATA "Albion Online")
+          )) {
             if (Test-Path $path) {
               Remove-Item $path -Recurse -Force
             }

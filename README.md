@@ -42,12 +42,12 @@ pdm run decrypt --main-game-folder <path_to_base_directory> --output ./data --fl
 
 ## GitHub Actions
 
-The `Update Albion Online data` workflow downloads Albion Online with SteamCMD, decrypts the `StreamingAssets/GameData` `.bin` files, replaces the repository's `data/` directory, removes the downloaded game, and commits the extracted XML and JSON files.
+The `Update Albion Online data` workflow downloads Albion Online with the official standalone Windows installer, decrypts the `StreamingAssets/GameData` `.bin` files, replaces the repository's `data/` directory, removes the downloaded game, and commits the extracted XML and JSON files.
 
 - Runs automatically daily at 11:00 UTC, one hour after the usual 10:00 UTC Albion Online maintenance window.
 - Can also be started manually with **Actions > Update Albion Online data > Run workflow**.
 - Requires repository Actions permission to read and write repository contents.
-- The workflow uses Steam application ID `761890` and GitHub-hosted Windows runners.
+- The workflow uses Albion Online's official standalone Windows installer and GitHub-hosted Windows runners.
 
 ## Disclaimer
 
